@@ -172,3 +172,65 @@ class EncoderCLIP(nn.Module):
             img_features = img_features.to(torch.float32)
 
         return img_features
+    
+class DecoderGRU(nn.Module):
+    def __init__(self, vocab_size, embed_size=300, hidden_size=512, num_layers=1, dropout=0.3):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.embed_size = embed_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+
+        self.embedding = nn.Embedding(vocab_size, embed_size)
+        self.img2hidden = nn.Linear(512, hidden_size)
+        self.gru = nn.GRU(embed_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
+        self.fc = nn.Linear(hidden_size, vocab_size)
+
+    def forward(self, captions, img_features, lengths=None, teacher_forcing=True):
+        # captions: (B, T) token ids including SOS at pos 0
+        # img_features: (B, 512)
+        B, T = captions.size()
+        device = captions.device
+        embeddings = self.embedding(captions) # (B, T, E)
+
+        h0 = torch.tanh(self.img2hidden(img_features)) # (B, H)
+        h0 = h0.unsqueeze(0).reapeat(self.num_layers, 1, 1) # GRU expects (num_layers, B, H)
+
+        outputs = torch.zeros(B, T, self.vocab_size, device=device)
+
+        if teacher_forcing:
+            # pack and run GRU once on full sequence
+            gru_in = embeddings[:, :-1, :]
+            out, _ = self.gru(gru_in, h0)
+            logits = self.fc(out) # (B, T-1, V)
+            outputs[:, 1:, :] = logits
+            return outputs
+        else:
+            # step-by-step generation
+            input_t = embeddings[:, 0:1, :] # SOS embedding
+            hidden = h0
+            for t in range(1, T):
+                out, hidden = self.gru(input_t, hidden)
+                logit = self.fc(out.squeeze(1)) # (B, V)
+                outputs[:, t, :] = logit
+
+                next_token = logit.argmax(dim=-1)
+                input_t = self.embedding(next_token).unsqueeze(1)
+            return outputs
+        
+    def generate(self, img_features, max_len=30, sos_indx=1, eos_indx=2, device='gpu'):
+        # greedy decoding for a single image/batch
+        if img_features.dim() == 1:
+            img_features = img_features.unsqueeze(0)
+        B = img_features.size(0)
+        generated = torch.full((B, max_len), fill_value=0, dtype=torch.long, device=device)
+        hidden = torch.tanh(self.img2hidden(img_features)).unsqueeze(0)
+        input_t = self.embedding(torch.tensor([sos_indx]*B, device=device)).unsqueeze(1)
+        
+        for t in range(1, max_len):
+            out, hidden = self.gru(input_t, hidden)
+            logit = self.fc(out.squeeze(1))
+            next_token = logit.argmax(dim=-1)
+            generated[:, t] = next_token
+            input_t = self.embedding(next_token).unsqueeze(1)
+        return generated.tolist()
