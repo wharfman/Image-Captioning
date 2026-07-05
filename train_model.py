@@ -33,9 +33,9 @@ class Vocab:
         self.UNK = '<UNK>' # replace unknown words with 'UNK'
 
     def build_vocab(self, sentences):
-        """ 
+        '''        
         tokenize all sentences and count num of times each word appears
-        """
+        '''
         counter = Counter()
         for s in sentences:
             tokens = self.tokenize(s)
@@ -90,3 +90,63 @@ class Vocab:
     
     def __len__(self):
         return len(self.word2indx)
+    
+class Flickr8kDataset(Dataset):
+    '''
+    process flickr8k dataset
+    '''
+    def __init__(self, images_root, captions_file, vocab, clip_preprocess, transform=None, max_caption_len=30, subset=None):
+        self.images_root = images_root
+        self.captions_file = captions_file
+        self.vocab = vocab
+        self.clip_preprocess = clip_preprocess
+        self.transform = transform
+        self.max_caption_len = max_caption_len
+
+        self.items = []
+        self._load_captions()
+        if subset is not None and subset < len(self.items):
+            random.seed(42)
+            self.items = random.sample(self.items, subset)
+
+    def _load_captions(self):
+        with open(self.captions_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    imgcap, caption = line.split('\t')
+                except ValueError:
+                    continue
+                img_name = imgcap.split('#')[0]
+                img_path = os.path.join(self.images_root, img_name)
+                if not os.path.exists(img_path):
+                    continue
+                self.items.append((img_path, caption))
+
+    def __len__(self):
+        return len(self.items)
+    
+    def __getitem__(self, indx):
+        img_path, caption = self.items[indx]
+        image = Image.open(img_path).convert('RGB')
+        image = self.clip_preprocess(image)
+
+        # caption -> ids
+        ids = self.vocab.encode(caption)
+        if len(ids) > self.max_caption_len:
+            ids = ids[:self.max_caption_len - 1] + [self.vocab.word2indx[self.vocab.EOS]]
+        return image, torch.tensor(ids, dtype=torch.long) 
+    
+
+    @staticmethod
+    def collate_fn(batch):
+        images, captions = zip(*batch)
+        images = torch.stack(images, dim=0)
+        lengths = [len(c) for c in captions]
+        max_len = max(lengths)
+        padded = torch.full((len(captions), max_len), fill_value=0, dtype=torch.long)
+        for i, c in enumerate(captions):
+            padded[i, :len(c)] = c
+        return images, padded, torch.tensor(lengths, dtype=torch.long)
