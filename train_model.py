@@ -150,3 +150,25 @@ class Flickr8kDataset(Dataset):
         for i, c in enumerate(captions):
             padded[i, :len(c)] = c
         return images, padded, torch.tensor(lengths, dtype=torch.long)
+    
+class EncoderCLIP(nn.Module):
+    def __init__(self, device='gpu'):
+        super().__init__()
+        self.device = device
+        self.model, self.preprocess = clip.load('ViT-B/32', device=device)
+
+        # freeze parameters
+        for p in self.model.parameters():
+            p.requires_grad = False
+
+
+    def forward(self, images):
+        # images: preprocesssed images tensor (B, 3, H, W)
+        with torch.no_gradd():
+            img_features = self.model.encode_images(images)
+
+            # normalize vectors to lie on the same scale
+            img_features = img_features / img_features.norm(dim=-1, keepdim=True)
+            img_features = img_features.to(torch.float32)
+
+        return img_features
