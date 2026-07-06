@@ -152,7 +152,7 @@ class Flickr8kDataset(Dataset):
         return images, padded, torch.tensor(lengths, dtype=torch.long)
     
 class EncoderCLIP(nn.Module):
-    def __init__(self, device='gpu'):
+    def __init__(self, device='cude'):
         super().__init__()
         self.device = device
         self.model, self.preprocess = clip.load('ViT-B/32', device=device)
@@ -218,7 +218,7 @@ class DecoderGRU(nn.Module):
                 input_t = self.embedding(next_token).unsqueeze(1)
             return outputs
         
-    def generate(self, img_features, max_len=30, sos_indx=1, eos_indx=2, device='gpu'):
+    def generate(self, img_features, max_len=30, sos_indx=1, eos_indx=2, device='cude'):
         # greedy decoding for a single image/batch
         if img_features.dim() == 1:
             img_features = img_features.unsqueeze(0)
@@ -226,7 +226,7 @@ class DecoderGRU(nn.Module):
         generated = torch.full((B, max_len), fill_value=0, dtype=torch.long, device=device)
         hidden = torch.tanh(self.img2hidden(img_features)).unsqueeze(0)
         input_t = self.embedding(torch.tensor([sos_indx]*B, device=device)).unsqueeze(1)
-        
+
         for t in range(1, max_len):
             out, hidden = self.gru(input_t, hidden)
             logit = self.fc(out.squeeze(1))
@@ -234,3 +234,235 @@ class DecoderGRU(nn.Module):
             generated[:, t] = next_token
             input_t = self.embedding(next_token).unsqueeze(1)
         return generated.tolist()
+    
+class CaptioningModel(nn.Module):
+    def __init__(self, encoder, decoder):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+
+    def forward(self, images, captions, teacher_forcing=True):
+        img_feats = self.encoder(images)
+        outputs = self.decoder(captions, img_feats, teacher_forcing=teacher_forcing)
+        return outputs
+    
+    def generate(self, images, max_len=30, sos_indx=1, eos_indx=2, device='cude'):
+        img_feats = self.encoder(images)
+        gen = self.decoder.generate(img_feats, max_len=max_len, sos_indx=sos_indx, eos_indx=eos_indx, device=device)
+        return gen
+
+class Trainer:
+    def __init__(self, model, vocab, device ='cude', save_dir='./checkpoints'):
+        self.model = model
+        self.vocab = vocab
+        self.device = device
+        self.criterion = nn.CrossEntropyLoss(ignore_index=self.vocab.word2indx[self.vocab.PAD])
+        self.save_dir = save_dir
+        os.makedirs(self.save_dir, exist_ok=True)
+
+    def train_epoch(self, dataloader, optimizer, epoch, clip_grad=5.0):
+        self.model.train()
+        total_loss = 0.0
+        pbar = tqdm(dataloader, desc=f"Train Epoch {epoch}")
+
+        scaler = torch.amp.GradScaler()
+
+        for images, captions, lengths in pbar:
+            images = images.to(self.device)
+            captions = captions.to(self.device)
+            optimizer.zero_grad()
+
+            with torch.amp.autocast():
+                outputs = self.model(images, captions, teacher_forcing=True)
+                targets = captions
+                B, T, V = outputs.size()
+                outputs_flat = outputs[:, 1:, :].contiguous().view(-1, V)
+                targets_flat = targets[:, 1:].contiguous().view(-1)
+                loss = self.criterion(outputs_flat, targets_flat)
+
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip_grad)
+                scaler.step(optimizer)
+                scaler.update()
+
+            total_loss += loss.item()
+            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+
+        return total_loss / len(dataloader)
+    
+    @torch.no_grad()
+    def validate(self, dataloader):
+        self.mode.eval()
+        total_loss = 0.0
+        for images, captions, lengths in tqdm(dataloader, desc='Valid'):
+            images = images.to(self.device)
+            captions = captions.to(self.device)
+            outputs = self.model(images, captions, teacher_forcing=True)
+            B, T, V = outputs.size()
+            outputs_flat = outputs[:, 1:, :].contiguous().view(-1, V)
+            targets_flat = captions[:, 1:].contiguous().view(-1)
+            loss = self.criterion(outputs_flat, targets_flat)
+            total_loss += loss.item()
+        return total_loss / len(dataloader)
+    
+    def save_checkpoint(self, epoch, optimizer, name='checkpoint.pt'):
+        path = os.path.join(self.save_dir, f'{name}')
+        state = {
+            'epoch': epoch,
+            'model_state': self.model.state_dict(),
+            'optimizer_state': optimizer.state_dict(),
+            'vocab': self.vocab.word2indx,
+        }
+        torch.save(state, path)
+        print(f"Saved checkpoint: {path}")
+
+    def load_checkpoint(self, path):
+        state = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(state['model_state'])
+        print(f"Loaded checkpoint from {path}")
+
+def build_vocab_from_captions(captions_file, min_freq=2, max_size=10000):
+    sents = []
+    with open(captions_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                _, caption = line.split('\t')
+            except ValueError:
+                continue
+            sents.append(caption)
+    vocab = Vocab(min_freq=min_freq, max_size=max_size)
+    vocab.build_vocab(sents)
+    print(f"Vocab size: {len(vocab)}")
+    return vocab
+
+def make_dataloaders(images_root, captions_file, vocab, encoder, batch_size=8, subset=None):
+    preprocess = encoder.preprocess
+    dataset = Flickr8kDataset(images_root, captions_file, vocab, clip_preprocess=preprocess, subset=subset)
+
+    n = len(dataset)
+    indxs = list(range(n))
+    random.shuffle(indxs)
+    split = int(0.9 * n)
+    train_indxs, val_indxs = indxs[:split], indxs[split:]
+    train_ds = Subset(dataset, train_indxs)
+    val_ds = Subset(dataset, val_indxs)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=Flickr8kDataset.collate_fn)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=Flickr8kDataset.collate_fn)
+    return train_loader, val_loader
+
+def main():
+    # Config
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print('Device', device)
+
+    # Paths
+    data_root = './flickr8k'
+    images_dir = 'Images'
+    captions_file = 'captions.txt'
+
+    images_root = os.path.join(data_root, images_dir)
+    captions_file_path = os.path.join(data_root, captions_file)
+
+    if not os.path.exists(images_root):
+        raise FileNotFoundError(f"Images directory not found: {images_root}")
+    if not os.path.exists(captions_file_path):
+        raise FileNotFoundError(f"Captions file not found: {captions_file_path}")
+    
+    # Hyperparameters
+    epochs = 100
+    batch_size = 32
+    embed_size = 300
+    hidden_size = 512
+    lr = 1e-3
+    vocab_size = 8000
+    subset = None
+    save_dir = './checkpoints'
+
+    # Build Vocab
+    vocab = build_vocab_from_captions(captions_file_path, min_freq=2, max_size=vocab_size)
+
+    # Model
+    encoder = EncoderCLIP(device=device)
+    decoder = DecoderGRU(len(vocab), embed_size=embed_size, hidden_size=hidden_size)
+    model = CaptioningModel(encoder, decoder).to(device)
+
+    # Dataloaders
+    train_loader, val_loader = make_dataloaders(images_root, captions_file_path, vocab, encoder, batch_size=batch_size, subset=subset)
+
+    # Trainer and Optimizer
+    trainer = Trainer(model, vocab, device=device, save_dir=save_dir)
+    optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=lr)
+
+    # Logfile
+    log_file = os.path.join(save_dir, 'loss_log.csv')
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Write header if file doesn;t exist
+    if not os.path.exists(log_file):
+        with open(log_file, mode='w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['epoch', 'train_loss', 'val_loss'])
+
+    best_val_loss = float('inf')
+    patience = 5
+    counter = 0
+
+    # Training Loop
+    for epoch in range(1, epochs + 1):
+        train_loss = trainer.train_epoch(train_loader, optimizer, epoch)
+        val_loss = trainer.validate(val_loader)
+        print(f"Epoch {epoch}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}")
+
+        # Log CSV
+        with open(log_file, mode='a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([epoch, train_loss, val_loss])
+
+        # Early stopping + checkpoint
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            counter = 0
+            trainer.save_checkpoint(epoch, optimizer, name='best_clip_caption.pt')
+            print(f"Validation loss decreased, checkpoint saved.")
+        else:
+            counter += 1
+            print(f"No improvement in val loss. Counter: {counter}/{patience}")
+            if counter >= patience:
+                print(f"Early stopping triggered at epoch {epoch}")
+                break
+
+        # Demo captions
+        model.eval()
+        with torch.no_grad():
+            for images, captions, lengths in val_loader:
+                images = images.to(device)
+                gen_ids = model.generate(images[:4], max_len=20,
+                                        sos_indx=vocab.word2indx[vocab.SOS],
+                                        eos_indx=vocab.word2indx[vocab.EOS],
+                                        device=device)
+                for i in range(min(4, len(gen_ids))):
+                    gen = vocab.decode(gen_ids[i])
+                    gt = vocab.decode(captions[i].tolist())
+                    print('GT :', gt)
+                    print('PRED:', gen)
+                    print('---')
+                break
+
+    print('Training finished.')
+
+    # Plot losses
+    df = pd.read_csv('checkpoints/loss_log.csv')
+    plt.plot(df['epoch'], df['train_loss'], label='Train Loss')
+    plt.plot(df['epoch'], df['val_loss'], label='Val Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.show()
+
+
+if __name__ == '__main__':
+    main()
