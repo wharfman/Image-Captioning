@@ -110,16 +110,17 @@ class Flickr8kDataset(Dataset):
             self.items = random.sample(self.items, subset)
 
     def _load_captions(self):
-        with open(self.captions_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
+        with open(self.captions_file, 'r', encoding='utf-8', newline='') as f:
+            reader = csv.reader(f)
+            next(reader, None)  # skip header row: "image,caption"
+            for row in reader:
+                if len(row) != 2:
                     continue
-                try:
-                    imgcap, caption = line.split('\t')
-                except ValueError:
+                img_name, caption = row
+                img_name = img_name.strip()
+                caption = caption.strip()
+                if not img_name or not caption:
                     continue
-                img_name = imgcap.split('#')[0]
                 img_path = os.path.join(self.images_root, img_name)
                 if not os.path.exists(img_path):
                     continue
@@ -164,8 +165,8 @@ class EncoderCLIP(nn.Module):
 
     def forward(self, images):
         # images: preprocesssed images tensor (B, 3, H, W)
-        with torch.no_gradd():
-            img_features = self.model.encode_images(images)
+        with torch.no_grad():
+            img_features = self.model.encode_image(images)
 
             # normalize vectors to lie on the same scale
             img_features = img_features / img_features.norm(dim=-1, keepdim=True)
@@ -183,8 +184,37 @@ class DecoderGRU(nn.Module):
 
         self.embedding = nn.Embedding(vocab_size, embed_size)
         self.img2hidden = nn.Linear(512, hidden_size)
-        self.gru = nn.GRU(embed_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
+
+        # Stack of GRUCells replaces nn.GRU. The fused nn.GRU kernel hits
+        # MIOpen's RNN descriptor path, which crashes with
+        # miopenStatusUnknownError on some ROCm setups. GRUCell instead uses
+        # plain matmul/elementwise ops, which MIOpen handles without issue.
+        self.cells = nn.ModuleList([
+            nn.GRUCell(embed_size if i == 0 else hidden_size, hidden_size)
+            for i in range(num_layers)
+        ])
+        # Dropout between stacked layers only, matching nn.GRU's own convention
+        # (no dropout after the final layer's output).
+        self.dropout = nn.Dropout(dropout) if num_layers > 1 else nn.Identity()
         self.fc = nn.Linear(hidden_size, vocab_size)
+
+    def _init_hidden(self, img_features):
+        # Same initial hidden state broadcast to every layer, matching the
+        # old h0.repeat(num_layers, 1, 1) behavior.
+        h0 = torch.tanh(self.img2hidden(img_features)) # (B, H)
+        return [h0.clone() for _ in range(self.num_layers)]
+
+    def _step(self, input_t, hidden_states):
+        # input_t: (B, E) ; hidden_states: list of (B, H), one per layer
+        x = input_t
+        new_hidden = []
+        for i, cell in enumerate(self.cells):
+            h = cell(x, hidden_states[i])
+            new_hidden.append(h)
+            x = h
+            if i < self.num_layers - 1:
+                x = self.dropout(x)
+        return x, new_hidden # x is the output of the last layer, (B, H)
 
     def forward(self, captions, img_features, lengths=None, teacher_forcing=True):
         # captions: (B, T) token ids including SOS at pos 0
@@ -193,29 +223,27 @@ class DecoderGRU(nn.Module):
         device = captions.device
         embeddings = self.embedding(captions) # (B, T, E)
 
-        h0 = torch.tanh(self.img2hidden(img_features)) # (B, H)
-        h0 = h0.unsqueeze(0).reapeat(self.num_layers, 1, 1) # GRU expects (num_layers, B, H)
-
+        hidden_states = self._init_hidden(img_features)
         outputs = torch.zeros(B, T, self.vocab_size, device=device)
 
         if teacher_forcing:
-            # pack and run GRU once on full sequence
-            gru_in = embeddings[:, :-1, :]
-            out, _ = self.gru(gru_in, h0)
-            logits = self.fc(out) # (B, T-1, V)
-            outputs[:, 1:, :] = logits
+            # step through the sequence manually (was a single fused GRU call)
+            for t in range(T - 1):
+                input_t = embeddings[:, t, :] # (B, E)
+                out, hidden_states = self._step(input_t, hidden_states)
+                logits = self.fc(out) # (B, V)
+                outputs[:, t + 1, :] = logits
             return outputs
         else:
             # step-by-step generation
-            input_t = embeddings[:, 0:1, :] # SOS embedding
-            hidden = h0
+            input_t = embeddings[:, 0, :] # SOS embedding, (B, E)
             for t in range(1, T):
-                out, hidden = self.gru(input_t, hidden)
-                logit = self.fc(out.squeeze(1)) # (B, V)
+                out, hidden_states = self._step(input_t, hidden_states)
+                logit = self.fc(out) # (B, V)
                 outputs[:, t, :] = logit
 
                 next_token = logit.argmax(dim=-1)
-                input_t = self.embedding(next_token).unsqueeze(1)
+                input_t = self.embedding(next_token)
             return outputs
         
     def generate(self, img_features, max_len=30, sos_indx=1, eos_indx=2, device='cude'):
@@ -224,15 +252,15 @@ class DecoderGRU(nn.Module):
             img_features = img_features.unsqueeze(0)
         B = img_features.size(0)
         generated = torch.full((B, max_len), fill_value=0, dtype=torch.long, device=device)
-        hidden = torch.tanh(self.img2hidden(img_features)).unsqueeze(0)
-        input_t = self.embedding(torch.tensor([sos_indx]*B, device=device)).unsqueeze(1)
+        hidden_states = self._init_hidden(img_features)
+        input_t = self.embedding(torch.tensor([sos_indx]*B, device=device)) # (B, E)
 
         for t in range(1, max_len):
-            out, hidden = self.gru(input_t, hidden)
-            logit = self.fc(out.squeeze(1))
+            out, hidden_states = self._step(input_t, hidden_states)
+            logit = self.fc(out)
             next_token = logit.argmax(dim=-1)
             generated[:, t] = next_token
-            input_t = self.embedding(next_token).unsqueeze(1)
+            input_t = self.embedding(next_token)
         return generated.tolist()
     
 class CaptioningModel(nn.Module):
@@ -265,14 +293,14 @@ class Trainer:
         total_loss = 0.0
         pbar = tqdm(dataloader, desc=f"Train Epoch {epoch}")
 
-        scaler = torch.amp.GradScaler()
+        scaler = torch.amp.GradScaler(device=self.device if self.device in ('cuda', 'cpu') else 'cuda')
 
         for images, captions, lengths in pbar:
             images = images.to(self.device)
             captions = captions.to(self.device)
             optimizer.zero_grad()
 
-            with torch.amp.autocast():
+            with torch.amp.autocast(device_type=self.device if self.device in ('cuda', 'cpu') else 'cuda'):
                 outputs = self.model(images, captions, teacher_forcing=True)
                 targets = captions
                 B, T, V = outputs.size()
@@ -286,14 +314,15 @@ class Trainer:
                 scaler.step(optimizer)
                 scaler.update()
 
-            total_loss += loss.item()
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            loss_val = loss.item()  # single CPU-GPU sync point, reused below
+            total_loss += loss_val
+            pbar.set_postfix({'loss': f'{loss_val:.4f}'})
 
         return total_loss / len(dataloader)
     
     @torch.no_grad()
     def validate(self, dataloader):
-        self.mode.eval()
+        self.model.eval()
         total_loss = 0.0
         for images, captions, lengths in tqdm(dataloader, desc='Valid'):
             images = images.to(self.device)
@@ -324,14 +353,15 @@ class Trainer:
 
 def build_vocab_from_captions(captions_file, min_freq=2, max_size=10000):
     sents = []
-    with open(captions_file, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
+    with open(captions_file, 'r', encoding='utf-8', newline='') as f:
+        reader = csv.reader(f)
+        next(reader, None)  # skip header row: "image,caption"
+        for row in reader:
+            if len(row) != 2:
                 continue
-            try:
-                _, caption = line.split('\t')
-            except ValueError:
+            _, caption = row
+            caption = caption.strip()
+            if not caption:
                 continue
             sents.append(caption)
     vocab = Vocab(min_freq=min_freq, max_size=max_size)
@@ -339,7 +369,7 @@ def build_vocab_from_captions(captions_file, min_freq=2, max_size=10000):
     print(f"Vocab size: {len(vocab)}")
     return vocab
 
-def make_dataloaders(images_root, captions_file, vocab, encoder, batch_size=8, subset=None):
+def make_dataloaders(images_root, captions_file, vocab, encoder, batch_size=8, subset=None, num_workers=8):
     preprocess = encoder.preprocess
     dataset = Flickr8kDataset(images_root, captions_file, vocab, clip_preprocess=preprocess, subset=subset)
 
@@ -350,8 +380,17 @@ def make_dataloaders(images_root, captions_file, vocab, encoder, batch_size=8, s
     train_indxs, val_indxs = indxs[:split], indxs[split:]
     train_ds = Subset(dataset, train_indxs)
     val_ds = Subset(dataset, val_indxs)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=Flickr8kDataset.collate_fn)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=Flickr8kDataset.collate_fn)
+    # num_workers>0 loads/decodes images in parallel worker processes instead
+    # of blocking the main thread; pin_memory speeds up the host->GPU copy;
+    # persistent_workers avoids re-spawning workers every epoch.
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, collate_fn=Flickr8kDataset.collate_fn,
+        num_workers=num_workers, pin_memory=True, persistent_workers=(num_workers > 0),
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False, collate_fn=Flickr8kDataset.collate_fn,
+        num_workers=num_workers, pin_memory=True, persistent_workers=(num_workers > 0),
+    )
     return train_loader, val_loader
 
 def main():
@@ -374,10 +413,10 @@ def main():
     
     # Hyperparameters
     epochs = 100
-    batch_size = 32
-    embed_size = 300
-    hidden_size = 512
-    lr = 1e-3
+    batch_size = 768
+    embed_size = 512
+    hidden_size = 1024
+    lr = 3e-3
     vocab_size = 8000
     subset = None
     save_dir = './checkpoints'
@@ -391,7 +430,7 @@ def main():
     model = CaptioningModel(encoder, decoder).to(device)
 
     # Dataloaders
-    train_loader, val_loader = make_dataloaders(images_root, captions_file_path, vocab, encoder, batch_size=batch_size, subset=subset)
+    train_loader, val_loader = make_dataloaders(images_root, captions_file_path, vocab, encoder, batch_size=batch_size, subset=subset, num_workers=8)
 
     # Trainer and Optimizer
     trainer = Trainer(model, vocab, device=device, save_dir=save_dir)
