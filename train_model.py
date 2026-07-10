@@ -153,6 +153,117 @@ class Flickr8kDataset(Dataset):
             padded[i, :len(c)] = c
         return images, padded, torch.tensor(lengths, dtype=torch.long)
     
+class CachedFeatureDataset(Dataset):
+    '''
+    Serves precomputed CLIP features instead of raw images. The CLIP encoder
+    is frozen, so its output for a given image never changes: computing it
+    once and caching it removes the encoder (and all image loading/decoding)
+    from the per-epoch cost entirely, with zero accuracy impact. It also
+    avoids re-encoding the same image ~5x per epoch (Flickr8k has ~5
+    captions per image).
+    '''
+    def __init__(self, items, name2indx, patch_feats, pooled_feats, vocab, max_caption_len=30):
+        # items: list of (img_name, caption)
+        # patch_feats: (num_unique_images, N, D) float16 CPU tensor
+        # pooled_feats: (num_unique_images, D) float16 CPU tensor
+        self.items = items
+        self.name2indx = name2indx
+        self.patch_feats = patch_feats
+        self.pooled_feats = pooled_feats
+        self.vocab = vocab
+        self.max_caption_len = max_caption_len
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, indx):
+        img_name, caption = self.items[indx]
+        fi = self.name2indx[img_name]
+        patches = self.patch_feats[fi].to(torch.float32)
+        pooled = self.pooled_feats[fi].to(torch.float32)
+
+        ids = self.vocab.encode(caption)
+        if len(ids) > self.max_caption_len:
+            ids = ids[:self.max_caption_len - 1] + [self.vocab.word2indx[self.vocab.EOS]]
+        return patches, pooled, torch.tensor(ids, dtype=torch.long)
+
+    @staticmethod
+    def collate_fn(batch):
+        patches, pooled, captions = zip(*batch)
+        patches = torch.stack(patches, dim=0)
+        pooled = torch.stack(pooled, dim=0)
+        lengths = [len(c) for c in captions]
+        max_len = max(lengths)
+        padded = torch.full((len(captions), max_len), fill_value=0, dtype=torch.long)
+        for i, c in enumerate(captions):
+            padded[i, :len(c)] = c
+        return patches, pooled, padded, torch.tensor(lengths, dtype=torch.long)
+
+
+def load_caption_items(images_root, captions_file):
+    '''Parse captions.txt into a list of (img_name, caption), skipping missing images.'''
+    items = []
+    with open(captions_file, 'r', encoding='utf-8', newline='') as f:
+        reader = csv.reader(f)
+        next(reader, None)  # skip header row: "image,caption"
+        for row in reader:
+            if len(row) != 2:
+                continue
+            img_name, caption = row
+            img_name = img_name.strip()
+            caption = caption.strip()
+            if not img_name or not caption:
+                continue
+            if not os.path.exists(os.path.join(images_root, img_name)):
+                continue
+            items.append((img_name, caption))
+    return items
+
+
+@torch.no_grad()
+def precompute_clip_features(encoder, images_root, image_names, cache_path, batch_size=64):
+    '''
+    Run every unique image through the frozen CLIP encoder exactly once and
+    cache the (patch, pooled) features to disk. Subsequent runs load the
+    cache instead of recomputing (delete the cache file if you change the
+    CLIP model or the patch pooling).
+    '''
+    if os.path.exists(cache_path):
+        print(f"Loading cached CLIP features from {cache_path}")
+        cache = torch.load(cache_path, map_location='cpu')
+        if cache.get('image_names') == image_names:
+            return cache['patch_feats'], cache['pooled_feats'], cache['name2indx']
+        print("Cache does not match current image list, recomputing...")
+
+    preprocess = encoder.preprocess
+    device = encoder.device
+    patch_list, pooled_list = [], []
+    for i in tqdm(range(0, len(image_names), batch_size), desc='Precomputing CLIP features (one-time)'):
+        batch_names = image_names[i:i + batch_size]
+        imgs = torch.stack([
+            preprocess(Image.open(os.path.join(images_root, n)).convert('RGB'))
+            for n in batch_names
+        ], dim=0).to(device)
+        patches, pooled = encoder(imgs)
+        # float16 halves cache size; converted back to float32 per-sample in
+        # CachedFeatureDataset.__getitem__.
+        patch_list.append(patches.to(torch.float16).cpu())
+        pooled_list.append(pooled.to(torch.float16).cpu())
+
+    patch_feats = torch.cat(patch_list, dim=0)
+    pooled_feats = torch.cat(pooled_list, dim=0)
+    name2indx = {n: i for i, n in enumerate(image_names)}
+    torch.save({
+        'image_names': image_names,
+        'patch_feats': patch_feats,
+        'pooled_feats': pooled_feats,
+        'name2indx': name2indx,
+    }, cache_path)
+    size_gb = (patch_feats.numel() + pooled_feats.numel()) * 2 / 1e9
+    print(f"Saved feature cache: {cache_path} ({size_gb:.2f} GB)")
+    return patch_feats, pooled_feats, name2indx
+
+
 class EncoderCLIP(nn.Module):
     def __init__(self, device='cuda', clip_model='ViT-L/14'):
         super().__init__()
@@ -162,6 +273,7 @@ class EncoderCLIP(nn.Module):
         # no-grad) encoder compute per batch.
         self.model, self.preprocess = clip.load(clip_model, device=device)
         self.feature_dim = self.model.visual.output_dim
+        self.clip_name = clip_model.replace('/', '-')  # for cache filenames
 
         # freeze parameters
         for p in self.model.parameters():
@@ -347,11 +459,19 @@ class CaptioningModel(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
 
-    def forward(self, images, captions, teacher_forcing=True):
+    def forward(self, patch_feats, pooled_feats, captions, teacher_forcing=True):
+        # Training path: consumes precomputed CLIP features directly (the
+        # frozen encoder is bypassed entirely during training).
+        return self.decoder(captions, patch_feats, pooled_feats, teacher_forcing=teacher_forcing)
+
+    def generate_from_features(self, patch_feats, pooled_feats, max_len=30, sos_indx=1, eos_indx=2, device='cuda'):
+        return self.decoder.generate(patch_feats, pooled_feats, max_len=max_len, sos_indx=sos_indx, eos_indx=eos_indx, device=device)
+
+    def forward_images(self, images, captions, teacher_forcing=True):
+        # Convenience path for raw images (e.g. inference on new data).
         patch_feats, pooled_feats = self.encoder(images)
-        outputs = self.decoder(captions, patch_feats, pooled_feats, teacher_forcing=teacher_forcing)
-        return outputs
-    
+        return self.decoder(captions, patch_feats, pooled_feats, teacher_forcing=teacher_forcing)
+
     def generate(self, images, max_len=30, sos_indx=1, eos_indx=2, device='cuda'):
         patch_feats, pooled_feats = self.encoder(images)
         gen = self.decoder.generate(patch_feats, pooled_feats, max_len=max_len, sos_indx=sos_indx, eos_indx=eos_indx, device=device)
@@ -376,13 +496,14 @@ class Trainer:
 
         scaler = torch.amp.GradScaler(device=self.device if self.device in ('cuda', 'cpu') else 'cuda')
 
-        for images, captions, lengths in pbar:
-            images = images.to(self.device)
-            captions = captions.to(self.device)
+        for patch_feats, pooled_feats, captions, lengths in pbar:
+            patch_feats = patch_feats.to(self.device, non_blocking=True)
+            pooled_feats = pooled_feats.to(self.device, non_blocking=True)
+            captions = captions.to(self.device, non_blocking=True)
             optimizer.zero_grad()
 
             with torch.amp.autocast(device_type=self.device if self.device in ('cuda', 'cpu') else 'cuda'):
-                outputs = self.model(images, captions, teacher_forcing=True)
+                outputs = self.model(patch_feats, pooled_feats, captions, teacher_forcing=True)
                 targets = captions
                 B, T, V = outputs.size()
                 outputs_flat = outputs[:, 1:, :].contiguous().view(-1, V)
@@ -405,13 +526,14 @@ class Trainer:
     def validate(self, dataloader):
         self.model.eval()
         total_loss = 0.0
-        for images, captions, lengths in tqdm(
+        for patch_feats, pooled_feats, captions, lengths in tqdm(
             dataloader, desc='Valid',
             bar_format='{desc}: {percentage:3.0f}%|{bar}| batch {n_fmt}/{total_fmt} • elapsed: {elapsed} • remaining: {remaining} • {rate_fmt}{postfix}',
         ):
-            images = images.to(self.device)
-            captions = captions.to(self.device)
-            outputs = self.model(images, captions, teacher_forcing=True)
+            patch_feats = patch_feats.to(self.device, non_blocking=True)
+            pooled_feats = pooled_feats.to(self.device, non_blocking=True)
+            captions = captions.to(self.device, non_blocking=True)
+            outputs = self.model(patch_feats, pooled_feats, captions, teacher_forcing=True)
             B, T, V = outputs.size()
             outputs_flat = outputs[:, 1:, :].contiguous().view(-1, V)
             targets_flat = captions[:, 1:].contiguous().view(-1)
@@ -453,9 +575,18 @@ def build_vocab_from_captions(captions_file, min_freq=1, max_size=None):
     print(f"Vocab size: {len(vocab)}")
     return vocab
 
-def make_dataloaders(images_root, captions_file, vocab, encoder, batch_size=8, subset=None, num_workers=4):
-    preprocess = encoder.preprocess
-    dataset = Flickr8kDataset(images_root, captions_file, vocab, clip_preprocess=preprocess, subset=subset)
+def make_dataloaders(images_root, captions_file, vocab, encoder, batch_size=8, subset=None, cache_path='clip_features.pt'):
+    items = load_caption_items(images_root, captions_file)
+    if subset is not None and subset < len(items):
+        random.seed(42)
+        items = random.sample(items, subset)
+
+    # One-time (per cache file) encoding of each unique image.
+    image_names = sorted({name for name, _ in items})
+    patch_feats, pooled_feats, name2indx = precompute_clip_features(
+        encoder, images_root, image_names, cache_path
+    )
+    dataset = CachedFeatureDataset(items, name2indx, patch_feats, pooled_feats, vocab)
 
     n = len(dataset)
     indxs = list(range(n))
@@ -464,16 +595,16 @@ def make_dataloaders(images_root, captions_file, vocab, encoder, batch_size=8, s
     train_indxs, val_indxs = indxs[:split], indxs[split:]
     train_ds = Subset(dataset, train_indxs)
     val_ds = Subset(dataset, val_indxs)
-    # num_workers>0 loads/decodes images in parallel worker processes instead
-    # of blocking the main thread; pin_memory speeds up the host->GPU copy;
-    # persistent_workers avoids re-spawning workers every epoch.
+    # num_workers=0 on purpose: __getitem__ is now just an in-RAM tensor
+    # lookup (no image decoding), so worker processes would only add IPC
+    # overhead and each would hold its own copy of the feature cache.
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, collate_fn=Flickr8kDataset.collate_fn,
-        num_workers=num_workers, pin_memory=True, persistent_workers=(num_workers > 0),
+        train_ds, batch_size=batch_size, shuffle=True, collate_fn=CachedFeatureDataset.collate_fn,
+        num_workers=0, pin_memory=True,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False, collate_fn=Flickr8kDataset.collate_fn,
-        num_workers=num_workers, pin_memory=True, persistent_workers=(num_workers > 0),
+        val_ds, batch_size=batch_size, shuffle=False, collate_fn=CachedFeatureDataset.collate_fn,
+        num_workers=0, pin_memory=True,
     )
     return train_loader, val_loader
 
@@ -500,7 +631,7 @@ def main():
     batch_size = 512
     embed_size = 512
     hidden_size = 1024
-    lr = 1e-3
+    lr = 3e-3
     subset = None
     save_dir = './checkpoints'
 
@@ -517,7 +648,10 @@ def main():
     model = CaptioningModel(encoder, decoder).to(device)
 
     # Dataloaders
-    train_loader, val_loader = make_dataloaders(images_root, captions_file_path, vocab, encoder, batch_size=batch_size, subset=subset, num_workers=4)
+    # Dataloaders (features are precomputed once and cached; cache filename
+    # is keyed to the CLIP model so switching models triggers a recompute)
+    feature_cache = os.path.join(data_root, f'clip_features_{encoder.clip_name}.pt')
+    train_loader, val_loader = make_dataloaders(images_root, captions_file_path, vocab, encoder, batch_size=batch_size, subset=subset, cache_path=feature_cache)
 
     # Trainer and Optimizer
     trainer = Trainer(model, vocab, device=device, save_dir=save_dir)
@@ -534,7 +668,7 @@ def main():
             writer.writerow(['epoch', 'train_loss', 'val_loss'])
 
     best_val_loss = float('inf')
-    patience = 5
+    patience = 10
     counter = 0
 
     # Training Loop
@@ -564,17 +698,18 @@ def main():
         # Demo captions
         model.eval()
         with torch.no_grad():
-            for images, captions, lengths in val_loader:
-                images = images.to(device)
-                gen_ids = model.generate(images[:4], max_len=20,
+            for patch_feats, pooled_feats, captions, lengths in val_loader:
+                patch_feats = patch_feats[:4].to(device)
+                pooled_feats = pooled_feats[:4].to(device)
+                gen_ids = model.generate_from_features(patch_feats, pooled_feats, max_len=20,
                                         sos_indx=vocab.word2indx[vocab.SOS],
                                         eos_indx=vocab.word2indx[vocab.EOS],
                                         device=device)
                 for i in range(min(4, len(gen_ids))):
                     gen = vocab.decode(gen_ids[i])
                     gt = vocab.decode(captions[i].tolist())
-                    print('GT :', gt)
-                    print('PRED:', gen)
+                    print('Correct Caption :', gt)
+                    print('Predicted Caption:', gen)
                     print('---')
                 break
 
