@@ -16,6 +16,19 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 
+# ---------------------------------------------------------------------------
+# Model configuration -- single source of truth.
+# server.py imports these, so changing them here is the ONLY place they need
+# to change. Note: they describe the architecture a checkpoint was trained
+# with; if you change them, existing checkpoints will no longer load until
+# you retrain (the weight shapes must match).
+# ---------------------------------------------------------------------------
+CLIP_MODEL = 'ViT-L/14'
+EMBED_SIZE = 512
+HIDDEN_SIZE = 1024
+MAX_LEN = 30  # max generated caption length at inference
+
+
 class Vocab:
     '''
     text pre-processing pipeline
@@ -434,24 +447,87 @@ class DecoderGRU(nn.Module):
                 input_t = self.embedding(next_token)
             return outputs
         
-    def generate(self, patch_features, pooled_features, max_len=30, sos_indx=1, eos_indx=2, device='cuda'):
-        # greedy decoding for a single image/batch
+    def generate(self, patch_features, pooled_features, max_len=30, sos_indx=1, eos_indx=2, device='cuda', beam_size=5):
+        '''
+        Beam search decoding (replaces greedy argmax).
+
+        Greedy commits to the single locally-likeliest word at every step
+        and can never reconsider -- if "black" edges out "brown" by a
+        sliver when describing a brown dog, "black" wins forever. Beam
+        search keeps the `beam_size` best partial sentences alive at each
+        step and finally returns the best *complete* sentence by
+        length-normalized log-probability, which reduces exactly those
+        small local errors. beam_size=1 is equivalent to greedy.
+
+        Returns the same format as before: a list (one per image) of token
+        id lists, so vocab.decode works unchanged on each.
+        '''
         if patch_features.dim() == 2:
             patch_features = patch_features.unsqueeze(0)
         if pooled_features.dim() == 1:
             pooled_features = pooled_features.unsqueeze(0)
         B = pooled_features.size(0)
-        generated = torch.full((B, max_len), fill_value=0, dtype=torch.long, device=device)
-        hidden_states = self._init_hidden(pooled_features)
-        input_t = self.embedding(torch.tensor([sos_indx]*B, device=device)) # (B, E)
 
-        for t in range(1, max_len):
-            out, hidden_states, _ = self._step(input_t, hidden_states, patch_features)
-            logit = self.fc(out)
-            next_token = logit.argmax(dim=-1)
-            generated[:, t] = next_token
-            input_t = self.embedding(next_token)
-        return generated.tolist()
+        results = []
+        # Beams are per-image, so decode one image at a time, treating its
+        # live beams as a mini-batch through _step.
+        for b in range(B):
+            patches_1 = patch_features[b:b+1]   # (1, N, D)
+            pooled_1 = pooled_features[b:b+1]   # (1, D)
+
+            # Each beam: (tokens list, cumulative log-prob, hidden_states)
+            init_hidden = self._init_hidden(pooled_1)
+            beams = [([sos_indx], 0.0, init_hidden)]
+            finished = []  # completed beams: (tokens, cumulative log-prob)
+
+            for _ in range(max_len - 1):
+                if not beams:
+                    break
+                k = len(beams)
+                # Batch all live beams through one _step call.
+                last_tokens = torch.tensor([bm[0][-1] for bm in beams], device=device)
+                input_t = self.embedding(last_tokens)  # (k, E)
+                hidden_batch = [
+                    torch.cat([bm[2][layer] for bm in beams], dim=0)  # (k, H)
+                    for layer in range(self.num_layers)
+                ]
+                patches_k = patches_1.expand(k, -1, -1)  # (k, N, D)
+
+                out, new_hidden, _ = self._step(input_t, hidden_batch, patches_k)
+                log_probs = torch.log_softmax(self.fc(out), dim=-1)  # (k, V)
+
+                # Every (beam, next-word) continuation, scored by total log-prob.
+                scores = log_probs + torch.tensor(
+                    [bm[1] for bm in beams], device=device
+                ).unsqueeze(1)  # (k, V)
+                flat = scores.view(-1)
+                top_scores, top_idx = flat.topk(min(beam_size, flat.numel()))
+
+                new_beams = []
+                V = log_probs.size(-1)
+                for score, idx in zip(top_scores.tolist(), top_idx.tolist()):
+                    beam_i, word = divmod(idx, V)
+                    tokens = beams[beam_i][0] + [word]
+                    hidden = [layer[beam_i:beam_i+1] for layer in new_hidden]
+                    if word == eos_indx:
+                        finished.append((tokens, score))
+                    else:
+                        new_beams.append((tokens, score, hidden))
+                beams = new_beams
+
+                # Enough complete candidates to choose from -- stop early.
+                if len(finished) >= beam_size:
+                    break
+
+            # Any still-live beams count as candidates too (hit max_len).
+            finished.extend((bm[0], bm[1]) for bm in beams)
+
+            # Length-normalized score: without dividing by length, beam
+            # search systematically favors shorter sentences (every added
+            # word makes the log-prob more negative).
+            best_tokens, _ = max(finished, key=lambda f: f[1] / len(f[0]))
+            results.append(best_tokens)
+        return results
     
 class CaptioningModel(nn.Module):
     def __init__(self, encoder, decoder):
@@ -464,17 +540,17 @@ class CaptioningModel(nn.Module):
         # frozen encoder is bypassed entirely during training).
         return self.decoder(captions, patch_feats, pooled_feats, teacher_forcing=teacher_forcing)
 
-    def generate_from_features(self, patch_feats, pooled_feats, max_len=30, sos_indx=1, eos_indx=2, device='cuda'):
-        return self.decoder.generate(patch_feats, pooled_feats, max_len=max_len, sos_indx=sos_indx, eos_indx=eos_indx, device=device)
+    def generate_from_features(self, patch_feats, pooled_feats, max_len=30, sos_indx=1, eos_indx=2, device='cuda', beam_size=5):
+        return self.decoder.generate(patch_feats, pooled_feats, max_len=max_len, sos_indx=sos_indx, eos_indx=eos_indx, device=device, beam_size=beam_size)
 
     def forward_images(self, images, captions, teacher_forcing=True):
         # Convenience path for raw images (e.g. inference on new data).
         patch_feats, pooled_feats = self.encoder(images)
         return self.decoder(captions, patch_feats, pooled_feats, teacher_forcing=teacher_forcing)
 
-    def generate(self, images, max_len=30, sos_indx=1, eos_indx=2, device='cuda'):
+    def generate(self, images, max_len=30, sos_indx=1, eos_indx=2, device='cuda', beam_size=5):
         patch_feats, pooled_feats = self.encoder(images)
-        gen = self.decoder.generate(patch_feats, pooled_feats, max_len=max_len, sos_indx=sos_indx, eos_indx=eos_indx, device=device)
+        gen = self.decoder.generate(patch_feats, pooled_feats, max_len=max_len, sos_indx=sos_indx, eos_indx=eos_indx, device=device, beam_size=beam_size)
         return gen
 
 class Trainer:
@@ -626,11 +702,12 @@ def main():
     if not os.path.exists(captions_file_path):
         raise FileNotFoundError(f"Captions file not found: {captions_file_path}")
     
-    # Hyperparameters
+    # Hyperparameters (architecture values come from the module-level
+    # constants at the top of this file -- shared with server.py)
     epochs = 100
     batch_size = 512
-    embed_size = 512
-    hidden_size = 1024
+    embed_size = EMBED_SIZE
+    hidden_size = HIDDEN_SIZE
     lr = 3e-3
     subset = None
     save_dir = './checkpoints'
@@ -643,7 +720,7 @@ def main():
     vocab = build_vocab_from_captions(captions_file_path, min_freq=1, max_size=None)
 
     # Model
-    encoder = EncoderCLIP(device=device)  # now defaults to ViT-L/14
+    encoder = EncoderCLIP(device=device, clip_model=CLIP_MODEL)
     decoder = DecoderGRU(len(vocab), feature_dim=encoder.feature_dim, embed_size=embed_size, hidden_size=hidden_size)
     model = CaptioningModel(encoder, decoder).to(device)
 
@@ -668,7 +745,7 @@ def main():
             writer.writerow(['epoch', 'train_loss', 'val_loss'])
 
     best_val_loss = float('inf')
-    patience = 10
+    patience = 5
     counter = 0
 
     # Training Loop
@@ -708,8 +785,8 @@ def main():
                 for i in range(min(4, len(gen_ids))):
                     gen = vocab.decode(gen_ids[i])
                     gt = vocab.decode(captions[i].tolist())
-                    print('Correct Caption :', gt)
-                    print('Predicted Caption:', gen)
+                    print('GT :', gt)
+                    print('PRED:', gen)
                     print('---')
                 break
 

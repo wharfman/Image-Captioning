@@ -15,13 +15,16 @@ from PIL import Image, UnidentifiedImageError
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
-# Reuse the exact classes the checkpoint was trained with -- no copies.
-from train_model import Vocab, EncoderCLIP, DecoderGRU, CaptioningModel
+# Reuse the exact classes AND configuration the checkpoint was trained
+# with -- train_model.py is the single source of truth. Change EMBED_SIZE,
+# HIDDEN_SIZE, CLIP_MODEL, or MAX_LEN there and this server picks them up
+# automatically.
+from train_model import (
+    Vocab, EncoderCLIP, DecoderGRU, CaptioningModel,
+    CLIP_MODEL, EMBED_SIZE, HIDDEN_SIZE, MAX_LEN,
+)
 
 CHECKPOINT = './checkpoints/best_clip_caption.pt'
-EMBED_SIZE = 512    # must match the values used in training
-HIDDEN_SIZE = 1024
-MAX_LEN = 30
 
 # ---- Load everything ONCE at startup (same pattern as the Gradio app) ----
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -34,7 +37,7 @@ vocab = Vocab()
 vocab.word2indx = ckpt['vocab']
 vocab.indx2word = {i: w for w, i in vocab.word2indx.items()}
 
-encoder = EncoderCLIP(device=device)
+encoder = EncoderCLIP(device=device, clip_model=CLIP_MODEL)
 decoder = DecoderGRU(len(vocab), feature_dim=encoder.feature_dim,
                      embed_size=EMBED_SIZE, hidden_size=HIDDEN_SIZE)
 model = CaptioningModel(encoder, decoder).to(device)
